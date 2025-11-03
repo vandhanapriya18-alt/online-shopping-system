@@ -1,0 +1,741 @@
+import tkinter as tk
+from tkinter import ttk
+from tkinter import messagebox, ttk
+import pymysql
+import random as r
+import pygame as p
+import pywhatkit as pk
+from PIL import Image, ImageTk
+import os
+import hashlib
+import datetime as dt
+
+# ===================== CONFIG =====================
+DB_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "port": 3306,
+    "password": "vandhanapriya2005",
+    "database": "shopping"
+}
+
+ASSETS = {
+
+    "main_bg": r"C:\Users\ASUS\Downloads\pexels-n-voitkevich-6214361.jpg",
+    "success_sound":r"C:\Users\ASUS\Downloads\success-221935.mp3"
+}
+
+FILES = {
+    "log": "shopping_app.log",
+    "orders_folder": "orders"  # receipts will be saved here
+}
+
+# ===================== UTILITIES =====================
+class FileManager:
+    def __init__(self, log_path: str, orders_folder: str):
+        self.log_path = log_path
+        self.orders_folder = orders_folder
+        os.makedirs(self.orders_folder, exist_ok=True)
+        # Touch the log file
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n===== App Started at {dt.datetime.now()} =====\n")
+        except Exception:
+            # If logging itself fails, silently ignore to keep app running
+            pass
+
+    def log(self, level: str, msg: str):
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {level.upper()}: {msg}\n")
+        except Exception:
+            pass
+
+    def save_receipt(self, username: str, product: str, qty: int, total: int, method: str) -> str:
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"receipt_{username}_{ts}.txt"
+        path = os.path.join(self.orders_folder, filename)
+        body = (
+            "\n" + "*"*42 + "\n" +
+            f"Date     : {dt.datetime.now():%Y-%m-%d %H:%M:%S}\n"+
+            f"Name     : {username}\n"+
+            f"Product  : {product}\n"+
+            f"Quantity : {qty}\n"+
+            f"Total    : ₹{total}\n"+
+            f"Payment  : {method}\n"+
+            "*"*42 + "\n"
+        )
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(body)
+            self.log("info", f"Receipt saved to {path}")
+        except Exception as e:
+            self.log("error", f"Failed to save receipt: {e}")
+        return path
+
+
+class SoundManager:
+    def __init__(self, success_path: str | None):
+        # pygame init can fail gracefully if sound device not present
+        try:
+            p.init()
+            p.mixer.init()
+        except Exception:
+            pass
+        self.success_path = success_path
+
+    def play_success(self):
+        try:
+            if self.success_path and os.path.exists(self.success_path):
+                p.mixer.music.load(self.success_path)
+                p.mixer.music.play()
+        except Exception:
+            # non-blocking: sound is optional
+            pass
+
+
+# ===================== DATABASE =====================
+class Database:
+    def __init__(self, config: dict, fm: FileManager):
+        self.config = config.copy()
+        self.fm = fm
+        # Ensure DB exists and tables exist
+        self._ensure_database()
+        self._init_tables()
+
+    def _connect_no_db(self):
+        cfg = self.config.copy()
+        cfg.pop("database", None)
+        return pymysql.connect(**cfg)
+
+    def connect(self):
+        # Connect using the configured database
+        return pymysql.connect(**self.config)
+
+    def _ensure_database(self):
+        # If DB doesn't exist, create it
+        try:
+            conn = self.connect()
+            conn.close()
+        except pymysql.err.OperationalError as e:
+            # typical message contains 'Unknown database' when database missing
+            try:
+                self.fm.log("info", f"Database '{self.config.get('database')}' not present; attempting to create it.")
+                conn = self._connect_no_db()
+                cur = conn.cursor()
+                dbname = self.config.get("database")
+                cur.execute(f"CREATE DATABASE IF NOT EXISTS `{dbname}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
+                conn.commit()
+                conn.close()
+                self.fm.log("info", f"Database '{dbname}' ensured/created.")
+            except Exception as e2:
+                self.fm.log("error", f"Failed to create database: {e2}")
+                raise
+
+    def _init_tables(self):
+        try:
+            db = self.connect()
+            cur = db.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT PRIMARY KEY AUTO_INCREMENT,
+                    name VARCHAR(100) NOT NULL,
+                    phone VARCHAR(20) NOT NULL,
+                    email VARCHAR(120) NOT NULL,
+                    gender VARCHAR(10) NOT NULL,
+                    password_hash VARCHAR(128) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS orders (
+                    id INT PRIMARY KEY AUTO_INCREMENT,
+                    username VARCHAR(100) NOT NULL,
+                    product VARCHAR(100) NOT NULL,
+                    qty INT NOT NULL,
+                    amount INT NOT NULL,
+                    payment VARCHAR(20) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            db.commit()
+            db.close()
+            self.fm.log("info", "Tables ensured.")
+        except Exception as e:
+            self.fm.log("error", f"Init tables failed: {e}")
+
+    def register_user(self, name, phone, email, gender, password):
+        pwd_hash = hashlib.sha256(password.encode()).hexdigest()
+        try:
+            db = self.connect()
+            cur = db.cursor()
+            cur.execute(
+                "INSERT INTO userss(name, phone, email, gender, password) VALUES (%s,%s,%s,%s,%s)",
+                (name, phone, email, gender, password)
+            )
+            db.commit()
+            db.close()
+            self.fm.log("info", f"User registered: {name}")
+            return True
+        except Exception as e:
+            self.fm.log("error", f"Register failed for {name}: {e}")
+            raise
+
+    def validate_login(self, name, password) -> bool:
+        pwd_hash = hashlib.sha256(password.encode()).hexdigest()
+        try:
+            db = self.connect()
+            cur = db.cursor()
+            # column is password (as created above)
+            cur.execute("SELECT * FROM userss WHERE name=%s AND password=%s", (name, password))
+            row = cur.fetchone()
+            db.close()
+            return bool(row)
+        except Exception as e:
+            self.fm.log("error", f"Login check failed for {name}: {e}")
+            raise
+
+
+    def insert_order(self, username, product, qty, amount, payment):
+        try:
+            db = self.connect()
+            cur = db.cursor()
+            cur.execute(
+                "INSERT INTO orders(username, product, qty, amount, payment) VALUES (%s,%s,%s,%s,%s)",
+                (username, product, qty, amount, payment)
+            )
+            db.commit()
+            db.close()
+            self.fm.log("info", f"Order placed by {username}: {product} x{qty} = ₹{amount}")
+        except Exception as e:
+            self.fm.log("error", f"Insert order failed: {e}")
+            raise
+
+
+# ===================== UI COMPONENTS =====================
+class BaseFrame(tk.Frame):
+    def __init__(self, master, app: "ShoppingApp", **kw):
+        super().__init__(master, **kw)
+        self.app = app
+        self.images = {}  # keep references to PhotoImage
+
+    def set_bg(self, path: str | None):
+        if not path or not os.path.exists(path):
+            return
+        try:
+            img = Image.open(path).resize((1920, 1080))
+            photo = ImageTk.PhotoImage(image=img)
+            self.images["bg"] = photo
+            tk.Label(self, image=photo).place(x=0, y=0)
+        except Exception as e:
+            self.app.fm.log("warn", f"Background skipped: {e}")
+
+
+class MainFrame(BaseFrame):
+    def __init__(self, master, app, **kw):
+        super().__init__(master, app, **kw)
+        self.set_bg(ASSETS.get("main_bg"))
+        tk.Button(self, text="🔑 Register Here 🔒", bg="#869D96", fg="white",
+                  font=("Caveat", 16), width=20, relief="ridge",
+                  command=lambda: self.app.show_frame("register")).place(x=800, y=450)
+        tk.Button(self, text="🔙 Exit", bg="#869D96", fg="white",
+                  font=("Caveat", 15), width=15, relief="ridge",
+                  command=self.app.root.destroy).place(x=850, y=550)
+
+
+class RegisterFrame(BaseFrame):
+    def __init__(self, master, app, **kw):
+        super().__init__(master, app, **kw)
+        self.set_bg(ASSETS.get("register_bg"))
+
+        tk.Label(self, text="🛒 Create Your Shopping Account 🛍️",
+                 bg="#9c89b8", fg="#27187e", font=("Michroma", 25)).place(x=525, y=35)
+
+        tk.Label(self, text="Full Name :", bg="#9c89b8", font=("Gloria Hallelujah", 18)).place(x=550, y=150)
+        self.rg_name = tk.Entry(self, bg="white", font=("Times New Roman", 15))
+        self.rg_name.place(x=850, y=155, width=300)
+
+        tk.Label(self, text="Mobile Number :", bg="#9c89b8", font=("Gloria Hallelujah", 18)).place(x=550, y=210)
+        self.rg_phone = tk.Entry(self, bg="white", font=("Times New Roman", 15))
+        self.rg_phone.place(x=850, y=215, width=300)
+
+        tk.Label(self, text="Email Address :", bg="#9c89b8", font=("Gloria Hallelujah", 18)).place(x=550, y=270)
+        self.rg_email = tk.Entry(self, bg="white", font=("Times New Roman", 15))
+        self.rg_email.place(x=850, y=270, width=300)
+
+        tk.Label(self, text="Gender :", bg="#9c89b8", font=("Gloria Hallelujah", 18)).place(x=550, y=330)
+        self.rg_gender = ttk.Combobox(self, values=["Male", "Female", "Other"], state="readonly", font=("Calibri", 14))
+        self.rg_gender.place(x=850, y=335, width=300)
+
+        tk.Label(self, text="Password :", bg="#9c89b8", font=("Gloria Hallelujah", 18)).place(x=550, y=390)
+        self.rg_password = tk.Entry(self, bg="white", font=("Times New Roman", 15), show="*")
+        self.rg_password.place(x=850, y=390, width=260)
+        self.btn_show1 = tk.Button(self, text="👁", command=lambda: self.toggle_password(self.rg_password, self.btn_show1))
+        self.btn_show1.place(x=1130, y=390)
+
+        tk.Label(self, text="Confirm Password :", bg="#9c89b8", font=("Gloria Hallelujah", 18)).place(x=550, y=450)
+        self.rg_cpassword = tk.Entry(self, bg="white", font=("Times New Roman", 15), show="*")
+        self.rg_cpassword.place(x=850, y=450, width=260)
+        self.btn_show2 = tk.Button(self, text="👁", command=lambda: self.toggle_password(self.rg_cpassword, self.btn_show2))
+        self.btn_show2.place(x=1130, y=450)
+
+        tk.Button(self, text="⏩ Forward", bg="#858ae3", fg="white",
+                  font=("VT323", 20), width=15, relief="ridge",
+                  command=lambda: self.app.show_frame("login")).place(x=650, y=620)
+
+        tk.Button(self, text="✅ Register", bg="#858ae3", fg="white",
+                  font=("VT323", 20), width=15, relief="ridge",
+                  command=self.save_register).place(x=1020, y=620)
+
+
+    def toggle_password(self, entry, button):
+        if entry.cget("show") == "":
+            entry.config(show="*")
+            button.config(text="👁")
+        else:
+            entry.config(show="")
+            button.config(text="🙈")
+
+    def save_register(self):
+        name = self.rg_name.get().strip()
+        phone = self.rg_phone.get().strip()
+        email = self.rg_email.get().strip()
+        gender = self.rg_gender.get().strip()
+        password = self.rg_password.get()
+        cpassword = self.rg_cpassword.get()
+
+        if not all([name, phone, email, gender, password, cpassword]):
+            messagebox.showerror("Error", "All fields are required!")
+            return
+        if password != cpassword:
+            messagebox.showerror("Error", "Passwords do not match!")
+            return
+        try:
+            self.app.db.register_user(name, phone, email, gender, password)
+            messagebox.showinfo("Success", "✅ Account Created Successfully!")
+            self.app.sound.play_success()
+            # clear fields
+            for e in (self.rg_name, self.rg_phone, self.rg_email, self.rg_password, self.rg_cpassword):
+                e.delete(0, tk.END)
+            self.rg_gender.set("")
+            self.app.show_frame("login")
+        except Exception as e:
+            messagebox.showerror("DB Error", str(e))
+
+
+class LoginFrame(BaseFrame):
+    def __init__(self, master, app, **kw):
+        super().__init__(master, app, **kw)
+        self.set_bg(ASSETS.get("login_bg"))
+
+        tk.Label(self, text="🔑 Login to Your Account", bg="#f0a6ca", fg="darkblue",
+                 font=("Michroma", 25)).place(x=600, y=35)
+
+        tk.Label(self, text="Username :", bg="#f0a6ca", font=("Gloria Hallelujah", 18),).place(x=560, y=250)
+        self.entry_login_name = tk.Entry(self, bg="white", font=("Calibri", 15))
+        self.entry_login_name.place(x=750, y=270, width=300)
+
+        tk.Label(self, text="Password :", bg="#f0a6ca", font=("Gloria Hallelujah", 18)).place(x=560, y=350)
+        self.entry_login_password = tk.Entry(self, bg="white", font=("Calibri", 15), show="*")
+        self.entry_login_password.place(x=750, y=370, width=300)
+
+        # Login Image
+        img = Image.open(r"C:\Users\ASUS\OneDrive\python\login.png")
+        img = img.resize((500, 434))   # Uncomment if you need resizing
+        self.pic1 = ImageTk.PhotoImage(img)  # store in self to avoid garbage collection
+        tk.Label(self, image=self.pic1, bg="#f0a6ca").place(x=50, y=125)
+
+        tk.Button(self, text="🔙 Return to Join", bg="#ff6392", fg="white",
+                  font=("VT323", 16), width=20, relief="ridge",
+                  command=lambda: self.app.show_frame("register")).place(x=650, y=470)
+
+        tk.Button(self, text="👀 Verify", bg="#ff6392", fg="white",
+                  font=("VT323", 16), width=12, relief="ridge",
+                  command=self.login_user).place(x=1020, y=470)
+
+    def login_user(self):
+        name = self.entry_login_name.get().strip()
+        password = self.entry_login_password.get()
+
+        if not name or not password:
+            messagebox.showerror("Error", "All fields are required!")
+            return
+        try:
+            if self.app.db.validate_login(name, password):
+                messagebox.showinfo("Success", f"✅ Welcome {name}!")
+                self.app.sound.play_success()
+                self.app.show_dashboard(name)
+            else:
+                messagebox.showerror("Error", "❌ Invalid Username/Password")
+        except Exception as e:
+            messagebox.showerror("DB Error", str(e))
+
+
+class DashboardFrame(BaseFrame):
+    def __init__(self, master, app, **kw):
+        super().__init__(master, app, **kw)
+        self.set_bg(ASSETS.get("dashboard_bg"))
+        self.username = ""
+        self.profile_img = None  # keep reference to avoid GC
+
+
+        # Sidebar frame
+        self.sidebar_frame = tk.Frame(self, bg="#1b262c", width=250)
+        self.sidebar_frame.pack(side="left", fill="y")
+
+        # Sidebar scrollable canvas
+        self.canvas = tk.Canvas(self.sidebar_frame, bg="#1b262c", highlightthickness=0)
+        self.scrollbar = tk.Scrollbar(self.sidebar_frame, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = tk.Frame(self.canvas, bg="#1b262c")
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+
+        # Sidebar buttons
+        self.menu_items = [
+            (r"C:\Users\ASUS\Downloads\home_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.png", "Home"),
+            (r"C:\Users\ASUS\Downloads\shopping_cart_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.png", "Shop"),
+            (r"C:\Users\ASUS\Downloads\orders_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.png", "Orders"),
+            (r"C:\Users\ASUS\Downloads\account_circle_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.png", "Profile"),
+            (r"C:\Users\ASUS\Downloads\rule_settings_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.png", "Settings")
+        ]
+        self.images = {}
+        self.sidebar_buttons = []
+
+        for img_file, menu_name in self.menu_items:
+            frame_btn = tk.Frame(self.scrollable_frame, bg="#a53860", pady=5)
+            frame_btn.pack(fill="x", padx=10, pady=5)
+
+            if os.path.exists(img_file):
+                img = Image.open(img_file).resize((25, 25))
+                photo = ImageTk.PhotoImage(img)
+                self.images[menu_name] = photo
+                btn = tk.Button(frame_btn, text=f"  {menu_name}", font=("Arial", 14),
+                                image=photo, compound="left", bg="#0f4c75", fg="white",
+                                relief="flat", anchor="w",
+                                command=lambda m=menu_name: self.show_content(m))
+            else:
+                btn = tk.Button(frame_btn, text=menu_name, font=("Arial", 14),
+                                bg="#0f4c75", fg="white", relief="flat",
+                                command=lambda m=menu_name: self.show_content(m))
+            btn.pack(fill="x", ipady=8)
+            btn.bind("<Enter>", lambda e, b=btn: b.config(bg="#3282b8"))
+            btn.bind("<Leave>", lambda e, b=btn: b.config(bg="#0f4c75"))
+            self.sidebar_buttons.append(btn)
+
+        # Logout button
+        self.btn_logout = tk.Button(self.sidebar_frame, text="Logout", font=("Arial", 14),
+                                    bg="#e84545", fg="white", relief="flat", width=20, pady=10,
+                                    command=lambda: app.show_frame("login"))
+        self.btn_logout.pack(side="bottom", pady=20)
+        self.btn_logout.bind("<Enter>", lambda e: self.btn_logout.config(bg="#ff0000"))
+        self.btn_logout.bind("<Leave>", lambda e: self.btn_logout.config(bg="#e84545"))
+
+        # Main content area
+        self.content_area = tk.Frame(self, bg="#caf0f8")
+        self.content_area.pack(side="left", fill="both", expand=True)
+
+        self.lbl_welcome = tk.Label(self.content_area, text="", bg="#caf0f8", fg="darkblue",
+                                    font=("Arial Black", 32))
+        self.lbl_welcome.pack(pady=50)
+        tk.Label(self.content_area, text="Select a menu option from the sidebar", font=("Arial", 16),
+                 bg="#caf0f8").pack(pady=20)
+
+    def set_username(self, username: str):
+        self.username = username
+        self.lbl_welcome.config(text=f"🏠 Welcome {username}!",font=("Libertinus Keyboard", 20),fg="#003249",)
+
+    def show_content(self, menu_name: str):
+        # Clear previous content
+        for widget in self.content_area.winfo_children():
+            widget.destroy()
+
+        tk.Label(self.content_area, text=f"{menu_name}", font=("Libertinus Keyboard", 28), bg="#caf0f8").pack(pady=20)
+
+        if menu_name == "Home":
+            tk.Label(self.content_area, text=f"❤️A hearty welcome {self.username}❤️", font=("Indie Flower", 16), bg="#caf0f8").pack(pady=20)
+
+            # # dashboard  Image
+            # img = Image.open(r"C:\Users\vandh\Downloads\dashboard-Photoroom.jpg")
+            # img = img.resize((500, 434))  # Uncomment if you need resizing
+            # self.pic1 = ImageTk.PhotoImage(img)  # store in self to avoid garbage collection
+            # tk.Label(self.content_area, image=self.pic1, bg="#f0a6ca").place(x=400, y=300)
+
+        elif menu_name == "Shop":
+            tk.Button(self.content_area, text="🛍 Start Shopping", bg="#007ea7", fg="white",
+                      font=("Caveat", 18), width=20, relief="ridge",
+                      command=self.open_shop_window).pack(pady=20)
+
+            tk.Button(self.content_area, text="🔙 Exit", bg="#007ea7", fg="white",
+                      font=("Caveat", 15), width=15, relief="ridge",
+                      command=self.app.root.destroy).pack(pady=20)
+
+
+        elif menu_name == "Orders":
+            tk.Label(self.content_area, text="Your Past Orders:", font=("Arial", 16), bg="#caf0f8").pack(pady=10)
+            # Table for orders
+            columns = ("Product", "Quantity", "Amount", "Payment", "Date")
+            tree = ttk.Treeview(self.content_area, columns=columns, show="headings", height=10)
+            for col in columns:
+                tree.heading(col, text=col)
+                tree.column(col, width=100, anchor="center")
+            tree.pack(pady=10)
+
+            try:
+                conn = self.app.db.connect()
+                cur = conn.cursor()
+                cur.execute("SELECT product, qty, amount, payment, created_at FROM orders WHERE username=%s ORDER BY created_at DESC", (self.username,))
+                rows = cur.fetchall()
+                conn.close()
+                for r in rows:
+                    tree.insert("", tk.END, values=r)
+            except Exception as e:
+                messagebox.showerror("DB Error", str(e))
+
+        elif menu_name == "Profile":
+            # Clear previous content
+            for widget in self.content_area.winfo_children():
+                widget.destroy()
+
+            # Profile Picture Path
+            profile_path = r"C:\Users\ASUS\OneDrive\python\girll.jpg"
+
+            # Title
+            tk.Label(self.content_area, text="Profile", font=("Arial", 30, "bold"), bg="#caf0f8").pack(pady=10)
+
+            # Profile Picture
+            if os.path.exists(profile_path):
+                try:
+                    img = Image.open(profile_path).resize((120, 120))
+                    self.profile_img = ImageTk.PhotoImage(img)  # must be instance variable
+                    tk.Label(self.content_area, image=self.profile_img, bg="#caf0f8").pack(pady=10)
+                except Exception as e:
+                    messagebox.showerror("Image Error", f"Failed to load image:\n{e}")
+            else:
+                messagebox.showwarning("Image Missing", f"Image not found:\n{profile_path}")
+
+            # User Details
+            try:
+                conn = self.app.db.connect()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT name, phone, email, gender, password FROM userss WHERE name=%s",
+                    (self.username,),
+                )
+                user = cur.fetchone()
+                conn.close()
+
+                if user:
+                    labels = ["Name", "Phone", "Email", "Gender", "Password"]
+                    for i, val in enumerate(user):
+                        tk.Label(
+                            self.content_area,
+                            text=f"{labels[i]}: {val}",
+                            font=("Arial", 14),
+                            bg="#caf0f8",
+                        ).pack(pady=5)
+                else:
+                    tk.Label(
+                        self.content_area,
+                        text="No user details found.",
+                        font=("Arial", 14),
+                        bg="#caf0f8",
+                    ).pack(pady=5)
+
+            except Exception as e:
+                messagebox.showerror("DB Error", str(e))
+
+
+
+        elif menu_name == "Settings":
+            tk.Label(self.content_area, text="Settings Panel", font=("Arial", 16), bg="#caf0f8").pack(pady=10)
+            tk.Checkbutton(self.content_area, text="Enable Notifications", bg="#caf0f8", font=("Arial", 14)).pack(pady=5)
+            tk.Checkbutton(self.content_area, text="Dark Mode", bg="#caf0f8", font=("Arial", 14)).pack(pady=5)
+            tk.Button(self.content_area, text="Save Settings", bg="#ffae42", fg="white", font=("Arial", 14),
+                      command=lambda: messagebox.showinfo("Settings", "Settings saved!")).pack(pady=10)
+
+    def open_shop_window(self):
+        ShopWindow(self.app.root, self.app, getattr(self, 'username', 'User'))
+
+
+class ShopWindow(tk.Toplevel):
+    def __init__(self, master, app, username: str):
+        super().__init__(master)
+        self.app = app
+        self.username = username
+        self.title("🛍 Shopping Categories")
+        self.geometry("700x400+300+120")
+        self.resizable(False, False)
+
+        tk.Label(self, text=f"Welcome {username}, Select a Category:", font=("Arial", 12)).pack(pady=10)
+
+        self.categories = ["Mobiles", "Fashion", "Sports Hub", "Electronics", "Furniture"]
+        self.cb = ttk.Combobox(self, values=self.categories, state="readonly")
+        self.cb.set("Choose Category")
+        self.cb.pack(pady=5)
+
+        tk.Button(self, text="Next", command=self.open_products).pack(pady=10)
+
+    def open_products(self):
+        cat = self.cb.get()
+        if cat == "Mobiles":
+            products = ["I-Phone", "One Plus", "Vivo", "Samsung", "Realme", "Moto"]
+            price_range = (20000, 100000)
+        elif cat == "Fashion":
+            products = ["Saree", "Jean", "Kurties", "Short Top", "Sweatshirts", "Polo T-shirts"]
+            price_range = (2000, 10000)
+        elif cat == "Sports Hub":
+            products = ["Cricket", "Team Sports", "Badminton", "Indoor Sports", "Cycles", "Fitness Accessories"]
+            price_range = (10000, 50000)
+        elif cat == "Electronics":
+            products = ["Laptop", "Projectors", "Printers", "Monitors", "Mouse", "Keyboard"]
+            price_range = (30000, 60000)
+        elif cat == "Furniture":
+            products = ["Sofas", "Shoe Rack", "TV Units", "Gaming Chairs"]
+            price_range = (25000, 100000)
+        else:
+            messagebox.showerror("Error", "Please choose a category!")
+            return
+
+        prod_win = tk.Toplevel(self)
+        prod_win.title("Products")
+        prod_win.geometry("500x220+360+180")
+        prod_win.resizable(False, False)
+
+        tk.Label(prod_win, text="Select Product:").grid(row=0, column=0, padx=8, pady=8)
+        prod_cb = ttk.Combobox(prod_win, values=products, state="readonly")
+        prod_cb.set("Choose Product")
+        prod_cb.grid(row=0, column=1, padx=8, pady=8)
+
+        tk.Label(prod_win, text="Quantity:").grid(row=1, column=0, padx=8, pady=8)
+        qty_entry = tk.Entry(prod_win)
+        qty_entry.grid(row=1, column=1, padx=8, pady=8)
+
+        def place_order():
+            try:
+                product = prod_cb.get()
+                if product not in products:
+                    messagebox.showerror("Error", "Please choose a product!")
+                    return
+                qty = int(qty_entry.get())
+                if qty <= 0:
+                    raise ValueError("Quantity must be positive")
+            except ValueError:
+                messagebox.showerror("Error", "Enter a valid quantity (number > 0)")
+                return
+
+            price = r.randint(price_range[0], price_range[1])
+            total = qty * price
+
+            payment_win = tk.Toplevel(prod_win)
+            payment_win.title("Payment")
+            payment_win.geometry("400x250+420+220")
+            payment_win.resizable(False, False)
+
+            tk.Label(payment_win, text=f"Product: {product}\nQty: {qty}\nTotal: ₹{total}", font=("Arial", 12)).pack(pady=10)
+
+            def confirm_payment(method):
+                try:
+                    self.app.db.insert_order(self.username, product, qty, total, method)
+                except Exception as e:
+                    messagebox.showerror("DB Error", str(e))
+                    return
+
+                self.app.sound.play_success()
+                receipt_path = self.app.fm.save_receipt(self.username, product, qty, total, method)
+                messagebox.showinfo("Success", f"✅ Order Successful!\nReceipt saved: {receipt_path}")
+
+                # Optional: send bill on WhatsApp (requires logged-in web WhatsApp)
+                bill = (
+                    "\n" + "*"*42 + "\n" +
+                    f"Name    : {self.username}\n"+
+                    f"Product : {product}\n"+
+                    f"Quantity: {qty}\n"+
+                    f"Price   : ₹{total}\n"+
+                    f"Payment : {method}\n"+
+                    "*"*42 + "\n"
+                )
+                try:
+                    user_num = "+919952444595"  # change to your test number
+                    pk.sendwhatmsg_instantly(user_num, bill, wait_time=10, tab_close=True)
+                except Exception:
+                    self.app.fm.log("warn", "WhatsApp message not sent. Check login/number.")
+
+                payment_win.destroy()
+                prod_win.destroy()
+                self.destroy()
+
+            tk.Button(payment_win, text="Pay with GPay", command=lambda: confirm_payment("GPay")).pack(pady=5)
+            tk.Button(payment_win, text="Cash on Delivery", command=lambda: confirm_payment("COD")).pack(pady=5)
+
+        tk.Button(prod_win, text="Place Order", command=place_order).grid(row=2, column=1, pady=10)
+
+
+# ===================== APP (Controller) =====================
+class ShoppingApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("📦 𝙾𝚗𝚕𝚒𝚗𝚎 𝚂𝚑𝚘𝚙𝚙𝚒𝚗𝚐 🛒")
+        self.root.geometry("1920x1080")
+
+        # managers
+        self.fm = FileManager(FILES["log"], FILES["orders_folder"])
+        self.sound = SoundManager(ASSETS.get("success_sound"))
+        self.db = Database(DB_CONFIG, self.fm)
+
+        # container
+        self.container = tk.Frame(self.root, bg="lightblue")
+        self.container.place(x=0, y=0, width=1920, height=1080)
+
+        # frames registry
+        self.frames: dict[str, BaseFrame] = {}
+        self._init_frames()
+
+        self.show_frame("main")
+
+    def _init_frames(self):
+        self.frames["main"] = MainFrame(self.container, self, background="white")
+        self.frames["register"] = RegisterFrame(self.container, self, background="#9c89b8")
+        self.frames["login"] = LoginFrame(self.container, self, background="#f0a6ca")
+        self.frames["dashboard"] = DashboardFrame(self.container, self, background="#b8bedd")
+
+
+        for f in self.frames.values():
+            f.place(x=0, y=0, width=1920, height=1080)
+
+    def show_frame(self, name: str):
+        frame = self.frames[name]
+        frame.tkraise()
+
+    def show_dashboard(self, username: str):
+        dash: DashboardFrame = self.frames["dashboard"]  # type: ignore
+        dash.set_username(username)
+        self.show_frame("dashboard")
+
+
+# ===================== MAIN =====================
+if __name__ == "__main__":
+    try:
+        root = tk.Tk()
+        app = ShoppingApp(root)
+        root.mainloop()
+    except Exception as e:
+        # Last-chance logging if GUI fails to start
+        try:
+            with open(FILES["log"], "a", encoding="utf-8") as f:
+                f.write(f"[FATAL] {dt.datetime.now():%Y-%m-%d %H:%M:%S} App crashed: {e}\n")
+        except Exception:
+            pass
+        raise
+
